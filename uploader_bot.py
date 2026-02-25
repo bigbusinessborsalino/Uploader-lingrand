@@ -1,31 +1,55 @@
 import os
 import re
 import time
+import threading
+import sys
+from flask import Flask, jsonify
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, filters
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
+# Force output to show up in Render logs immediately
+sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
-# --- NEW DATABASE SETUP ---
-# Use a DIFFERENT Mongo URI or a different Database Name here to keep it clean!
-MONGO_URI = os.getenv("NEW_DB_MONGO_URI") 
+# --- DATABASE SETUP ---
+MONGO_URI = os.getenv("NEW_DB_MONGO_URI")
 client = MongoClient(MONGO_URI)
-db = client.grandline_live_news  # New Database
-articles_col = db.articles       # New Collection
+db = client.grandline_live_news
+articles_col = db.articles
 
+# --- WEB SERVER (The Antenna for your Website) ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "✅ Bridge API is Online"
+
+@app.route('/api/news')
+def get_news():
+    try:
+        articles = list(articles_col.find({}, {"_id": 0}).sort("timestamp", -1))
+        response = jsonify(articles)
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response
+    except Exception as e:
+        print(f"❌ API Error: {e}")
+        return jsonify([])
+
+def run_flask():
+    # Render assigns a port dynamically. If it can't find one, it defaults to 10000.
+    port = int(os.environ.get("PORT", 10000))
+    print(f"📡 Starting Flask API on port {port}...")
+    app.run(host="0.0.0.0", port=port)
+
+# --- TELEGRAM BOT LOGIC ---
 def parse_telegram_message(text):
-    """Extracts data from the AI Writer's tagged format."""
     try:
         title = re.search(r"TITLE: (.*)", text).group(1).strip()
         image = re.search(r"IMAGE: (.*)", text).group(1).strip()
-        # Grabs everything between CONTENT: and the end tag
         content = re.search(r"CONTENT: (.*)---END_DATA---", text, re.DOTALL).group(1).strip()
-        
-        # Create a safe ID for the website URL
         safe_id = "".join(x for x in title if x.isalnum())[:20]
-        
         return {
             "_id": safe_id,
             "id": safe_id,
@@ -38,27 +62,32 @@ def parse_telegram_message(text):
             "timestamp": time.time()
         }
     except Exception as e:
-        print(f"Parsing error: {e}")
+        print(f"⚠️ Parsing failed: {e}")
         return None
 
-async def catch_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Listens for the specific tag and uploads to the new DB."""
+async def catch_and_upload(update: Update, context):
     text = update.message.text
-    if not text or "---NEW_ARTICLE_DATA---" not in text:
-        return
-
-    data = parse_telegram_message(text)
-    if data:
-        # Save to the new database
-        articles_col.update_one({"_id": data["_id"]}, {"$set": data}, upsert=True)
-        await update.message.reply_text(f"✅ Website Bridge: '{data['title']}' is now LIVE on the domain!")
+    if text and "---NEW_ARTICLE_DATA---" in text:
+        data = parse_telegram_message(text)
+        if data:
+            articles_col.update_one({"_id": data["_id"]}, {"$set": data}, upsert=True)
+            await update.message.reply_text(f"✅ Bridge: '{data['title']}' is now LIVE!")
 
 if __name__ == '__main__':
-    # Use a DIFFERENT bot token for this one so they don't conflict!
+    print("🚀 Initializing Bridge Bot...")
+    
+    # 1. Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # 2. Start the Telegram Bot
     token = os.getenv("UPLOADER_BOT_TOKEN")
-    app = ApplicationBuilder().token(token).build()
+    if not token:
+        print("❌ CRITICAL: UPLOADER_BOT_TOKEN is missing!")
+        sys.exit(1)
+
+    bot_app = ApplicationBuilder().token(token).build()
+    bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), catch_and_upload))
     
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), catch_and_upload))
-    
-    print("🚀 Bridge Bot is listening for AI articles...")
-    app.run_polling()
+    print("🤖 Telegram Polling Started...")
+    bot_app.run_polling()
